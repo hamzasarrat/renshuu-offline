@@ -149,6 +149,8 @@ const APP_URL = SRC ? new URL('./', SRC).href.split('?')[0] : (window.__RSO_APP 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const makeDiv = html => { const d = document.createElement('div'); d.innerHTML = html; return d; };
 const XH = { 'X-Requested-With': 'XMLHttpRequest' };
+let SKIP_WITH_REDO = false;
+try { SKIP_WITH_REDO = localStorage.getItem('rso.skipRedo') === '1'; } catch (e) { }
 function rpost(page, data) {
   return fetch('/index.php?page=' + page, {
     method: 'POST', credentials: 'include',
@@ -224,7 +226,10 @@ function toItem(sched, t, limit) {
   const due = [], unsupportedDue = [];
   for (const name of Object.keys(vecs)) {
     const v = vecs[name];
-    if (!v || v.last_quizzed === 'Not yet' || !v.next_quiz || v.next_quiz > limit) continue;
+    if (!v || !v.next_quiz) continue;
+    // "Now" = due immediately (e.g. recently missed); dates are YYYY/MM/DD
+    const isDue = v.next_quiz === 'Now' || (v.last_quizzed !== 'Not yet' && v.next_quiz <= limit);
+    if (!isDue) continue;
     (supported.includes(name) ? due : unsupportedDue).push(name);
   }
   let it;
@@ -320,15 +325,30 @@ async function doSync(payload) {
       const remaining = () => payload.results.filter(r => r.s === sid && !consumed.has(r.r)).length;
       log(`— ${name}: ${remaining()} answers to send`);
       let noProgress = 0, rounds = 0;
-      while (remaining() > 0 && noProgress < 3 && rounds < 40 && !stopFlag) {
+      while (remaining() > 0 && noProgress < 4 && rounds < 300 && !stopFlag) {
         rounds++;
         let resp = await startQuiz(sid);
         let q = parseQuizBody(resp.rquiz_body, makeDiv);
-        let sentThisRound = 0, stopReason = '';
+        let sentThisRound = 0, stopReason = '', skipsThisRound = 0;
+        // Step past a question that wasn't done offline: answer, then immediately "redo" it,
+        // which makes Renshuu discard that answer (verified: counts/mastery/next date restored).
+        const skipQuestion = async () => {
+          const now = Math.floor(Date.now() / 1000);
+          const raw = await rpost('quiz/run_quiz_ajax', { timestart: String(now - 3), elapsed: '3', qnum: String(q.qnum), answer: q.skipValue, randId: uuid(), initialGrab: '0', br_dark: '1' });
+          await rget('quiz/reverse_result&pushQ=1&action=redo&br_dark=1');
+          skipsThisRound++;
+          const j = JSON.parse(raw);
+          if (j.preload) { try { await rget('quiz/run_quiz_preload&br_dark=1'); } catch (e) { } }
+          return j.redirect ? { kind: 'end' } : parseQuizBody(j.rquiz_body || '', makeDiv);
+        };
         while (!stopFlag) {
           if (q.kind !== 'mc') { stopReason = q.kind === 'end' ? 'quiz finished' : 'unsupported question type'; break; }
           const m = matchQuestion(q, items);
-          if (m.status !== 'ok') { stopReason = m.status === 'ambiguous' ? 'ambiguous question “' + q.prompt.slice(0, 30) + '”' : 'question not done offline: “' + q.prompt.slice(0, 30) + '”'; break; }
+          if (m.status !== 'ok') {
+            stopReason = m.status === 'ambiguous' ? 'ambiguous question “' + q.prompt.slice(0, 30) + '”' : 'question not done offline: “' + q.prompt.slice(0, 30) + '”';
+            if (SKIP_WITH_REDO && skipsThisRound < 45) { log(`  skipped (not done offline): ${q.prompt.slice(0, 24)}`, 'dim'); q = await skipQuestion(); await sleep(250); continue; }
+            break;
+          }
           // pick result for this item+vector (or an alt vector when prompt/answer are identical)
           const vecs = m.alts || [m.v];
           let key = null, res = null;
@@ -342,7 +362,11 @@ async function doSync(payload) {
           let wantCorrect, el;
           if (res) { wantCorrect = !!res.ok; el = Math.max(2, Math.min(120, res.e || 8)); }
           else if (key && answeredKeys.has(key)) { wantCorrect = true; el = 4; }   // Renshuu re-asking a missed item in the same quiz
-          else { stopReason = 'question not done offline: “' + q.prompt.slice(0, 30) + '”'; break; }
+          else {
+            stopReason = 'question not done offline: “' + q.prompt.slice(0, 30) + '”';
+            if (SKIP_WITH_REDO && skipsThisRound < 45) { log(`  skipped (not done offline): ${q.prompt.slice(0, 24)}`, 'dim'); q = await skipQuestion(); await sleep(250); continue; }
+            break;
+          }
           const answer = wantCorrect ? m.choice.value : q.skipValue;
           const now = Math.floor(Date.now() / 1000);
           const raw = await rpost('quiz/run_quiz_ajax', { timestart: String(now - el), elapsed: String(el), qnum: String(q.qnum), answer, randId: uuid(), initialGrab: '0', br_dark: '1' });
@@ -396,8 +420,14 @@ async function main() {
     const names = [...new Set(payload.results.map(r => r.s))].map(id => (payload.schedules.find(s => s.id === id) || {}).name || id);
     body(`<div class="card">Ready to send <b>${n}</b> offline answers (${right} correct, ${n - right} missed) for: ${names.join(', ')}.<br>
       <span class="dim">This answers real Renshuu quizzes for you, exactly as you answered offline. Keep this tab open until it finishes.</span></div>
+      <div class="card"><label><input type="checkbox" id="rso-skip" ${SKIP_WITH_REDO ? 'checked' : ''}> Step past questions I didn't do offline</label>
+      <div class="dim" style="font-size:13px;margin-top:4px">Uses Renshuu's “redo” to discard them, so a partial offline session syncs in one go. Off = restart the quiz whenever such a question comes up (slow if you did only part offline).</div></div>
       <button id="rso-go">Send to Renshuu</button>`);
-    $('#rso-go').onclick = () => { $('#rso-go').disabled = true; history.replaceState(null, '', '/me'); doSync(payload); };
+    $('#rso-go').onclick = () => {
+      SKIP_WITH_REDO = $('#rso-skip').checked;
+      try { localStorage.setItem('rso.skipRedo', SKIP_WITH_REDO ? '1' : '0'); } catch (e) { }
+      $('#rso-go').disabled = true; history.replaceState(null, '', '/me'); doSync(payload);
+    };
     return;
   }
   if (h === '#rso-get') history.replaceState(null, '', '/me');
