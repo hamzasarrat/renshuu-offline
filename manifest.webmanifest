@@ -1,0 +1,10 @@
+{
+  "name": "Renshuu Offline",
+  "short_name": "Renshuu Off",
+  "start_url": "./",
+  "scope": "./",
+  "display": "browser",
+  "background_color": "#12151d",
+  "theme_color": "#1a1f2b",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
